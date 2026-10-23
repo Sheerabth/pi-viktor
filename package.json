@@ -1,0 +1,16 @@
+{
+  "name": "pi-viktor",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "bun run src/index.ts"
+  },
+  "dependencies": {
+    "discord.js": "^14.18.1",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}
