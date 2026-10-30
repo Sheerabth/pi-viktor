@@ -23,8 +23,8 @@ export async function judge(ctx: GateContext): Promise<GateVerdict> {
     model: MODEL,
     state: {
       trigger: { author: ctx.author, text: ctx.message },
-      recent: ctx.recent.slice(-5),
-      note: "The bot named viktor is an active participant in this conversation (it was addressed moments ago).",
+      recent: ctx.recent.slice(-10),
+      note: "Viktor is an active participant in this conversation (addressed moments ago — the window is open). Everything in recent is inside the same 5-minute attention window: treat it all equally, no recency ranking. A follow-up to viktor's own last message, or asking it to do something with what was just discussed, is directed at viktor even with no name/tag. When in doubt while the window is open, reply — a short answer or clarifying question beats silence.",
     },
     questions: {
       reply: {

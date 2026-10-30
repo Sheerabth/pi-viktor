@@ -26,7 +26,7 @@ const recent = new Map<string, { author: string; text: string; ts: number }[]>()
 // One window per channel. Mechanical cross opens it (2 min);
 // every pi run resets it. Inside → Jev gates to pi. Outside → silent.
 const winExp = new Map<string, number>();
-const WINDOW_MS = 2 * 60 * 1000;
+const WINDOW_MS = 5 * 60 * 1000;
 function pushRecent(channelId: string, author: string, text: string) {
   const arr = recent.get(channelId) ?? [];
   arr.push({ author, text, ts: Date.now() });
@@ -35,8 +35,51 @@ function pushRecent(channelId: string, author: string, text: string) {
 }
 
 // Append-only: send just the new message. The pi session itself
-// tracks what it already has. Fetch-tools come later.
-async function runPi(msg: any) {
+// Last Discord message id pi has seen per channel. New sessions reset it.
+const lastFed = new Map<string, string>();
+const MIN5 = 5 * 60 * 1000;
+const HALF = 2.5 * 60 * 1000;
+const MAX_CTX_LINES = 40;
+
+// Fresh-window pre-context only. Plain trigger → last 5 min.
+// Reply trigger → up to 2.5 min below the replied-to message (y),
+// remainder (5-y, cap 2.5) above it.
+async function fetchPreContext(msg: any): Promise<string> {
+  try {
+    const ch: any = msg.channel;
+    const fmt = (m: any) => `[${m.author?.username ?? "?"}]: ${(m.content ?? "").slice(0, 300)}`;
+    const refId = msg.reference?.messageId;
+    if (!refId) {
+      const coll = await ch.messages.fetch({ limit: 50 });
+      const lines = [...coll.values()]
+        .filter((m: any) => Date.now() - m.createdTimestamp < MIN5 && m.id !== msg.id)
+        .sort((a: any, b: any) => (a.id < b.id ? -1 : 1))
+        .slice(-MAX_CTX_LINES)
+        .map(fmt);
+      return lines.length ? `Channel context (last 5 min, oldest first):\n${lines.join("\n")}\n\n` : "";
+    }
+    const ref = await msg.fetchReference().catch(() => null);
+    const refTs = ref ? ref.createdTimestamp : Date.now();
+    const below = await ch.messages.fetch({ before: refId, limit: 50 }).catch(() => null);
+    const belowLines = below
+      ? [...below.values()].filter((m: any) => refTs - m.createdTimestamp <= HALF).sort((a: any, b: any) => (a.id < b.id ? -1 : 1))
+      : [];
+    const y = belowLines.length ? Math.min(refTs - belowLines[0].createdTimestamp, HALF) : 0;
+    const aboveMs = Math.min(MIN5 - y, HALF);
+    const above = await ch.messages.fetch({ after: refId, limit: 50 }).catch(() => null);
+    const aboveLines = above
+      ? [...above.values()].filter((m: any) => m.createdTimestamp - refTs <= aboveMs && m.id !== msg.id).sort((a: any, b: any) => (a.id < b.id ? -1 : 1))
+      : [];
+    const refLine = ref ? fmt(ref) : "";
+    const all = [...belowLines.map(fmt), ...(refLine ? [`> ${refLine}  <-- replied-to`] : []), ...aboveLines.map(fmt)];
+    const trimmed = all.slice(-MAX_CTX_LINES);
+    return trimmed.length ? `Channel context around the replied-to message (oldest first):\n${trimmed.join("\n")}\n\n` : "";
+  } catch {
+    return "";
+  }
+}
+
+async function buildSeed(msg: any, pre = ""): Promise<string> {
   let ref = "";
   if (msg.reference?.messageId) {
     try {
@@ -44,34 +87,30 @@ async function runPi(msg: any) {
       ref = ` (replying to ${r.author?.username ?? "?"}: "${(r.content ?? "").slice(0, 300)}")`;
     } catch { /* ignore */ }
   }
-  const seed = `[channel:${msg.channelId}] [${msg.author.username}]${ref}: ${msg.content}`;
+  // Catch-up: everything since pi last saw, so the session never gaps.
+  // Only inside a live window — new sessions start blank (lastFed reset).
+  let missed = "";
+  const since = lastFed.get(msg.channelId);
+  if (since && since !== msg.id) {
+    try {
+      const coll = await (msg.channel as any).messages.fetch({ after: since, limit: 20 });
+      const lines = [...coll.values()]
+        .reverse()
+        .filter((m: any) => m.id !== msg.id && m.author?.id !== botId)
+        .map((m: any) => `[${m.author?.username ?? "?"}]: ${(m.content ?? "").slice(0, 300)}`);
+      if (lines.length) missed = `Missed since you last saw:\n${lines.join("\n")}\n`;
+    } catch { /* seed still goes out */ }
+  }
+  lastFed.set(msg.channelId, msg.id);
+  return `${pre}${missed}[channel:${msg.channelId}] [msg:${msg.id}] [${msg.author.username}(${msg.author.id})]${ref}: ${msg.content}`;
+}
+
+async function runPi(msg: any, pre = "") {
+  const seed = await buildSeed(msg, pre);
   try {
-    await (msg.channel as any).sendTyping?.();
     const ch: any = msg.channel;
-    // Only the final answer posts. Mid-run messages never reach Discord.
-    // First chunk honors [REPLY] (reply) vs default (normal message).
+    // Pi owns delivery via direct Discord API calls. Bot gates, types, logs.
     let settled = false;
-    let first = true;
-    const sendOne = async (t: string) => {
-      const reply = /^\[REPLY\]/i.test(t.trim());
-      t = t.replace(/\[REPLY\]/gi, "").replace(/\[SEND\]/gi, "").trim();
-      if (!t || t === "<SILENCE>") return;
-      // Long messages split at a newline/space under the limit.
-      const chunks: string[] = [];
-      while (t.length > 1900) {
-        let cut = t.lastIndexOf("\n", 1900);
-        if (cut < 900) cut = t.lastIndexOf(" ", 1900);
-        if (cut < 900) cut = 1900;
-        chunks.push(t.slice(0, cut));
-        t = t.slice(cut).trim();
-      }
-      chunks.push(t);
-      for (const c of chunks) {
-        if (first && reply) await msg.reply(c);
-        else await ch.send(c);
-        first = false;
-      }
-    };
     // Typing indicator ⟺ not settled.
     const keepTyping = async () => {
       while (!settled) {
@@ -82,9 +121,9 @@ async function runPi(msg: any) {
       }
     };
     const typingP = keepTyping();
-    let finalText = "";
+    let res: { text: string; posted: boolean };
     try {
-      finalText = await pi.ask(seed);
+      res = await pi.ask(seed);
     } catch (e: any) {
       settled = true;
       await typingP;
@@ -93,12 +132,11 @@ async function runPi(msg: any) {
     }
     settled = true;
     await typingP;
-    winExp.set(msg.channelId, Date.now() + WINDOW_MS);
-    if (!finalText || finalText.includes("<SILENCE>")) {
-      console.log(`[SILENT][${msg.channelId}] pi chose silence`);
-      return;
+    if (res.posted || pi.sentCount > 0) {
+      console.log(`[SENT x${pi.sentCount}][${msg.channelId}] ${msg.author.username}: ${msg.content.slice(0, 120)}`);
+    } else {
+      console.log(`[SILENT][${msg.channelId}] pi posted nothing (${(res.text ?? "").slice(0, 120)})`);
     }
-    await sendOne(finalText);
   } catch (e: any) {
     console.log(`[PI-ERR][${msg.channelId}] ${e?.message ?? e}`);
   }
@@ -130,9 +168,23 @@ client.on(Events.MessageCreate, async (msg) => {
   const flag = isTag ? "TAG" : isReplyToBot ? "REPLY" : isName ? "NAME" : "--";
 
   // Mechanical trigger: certain → straight to pi, Jev skipped.
+  // Window was open → same session. Closed → new session, then open.
   if (isTag || isReplyToBot || isName) {
-    console.log(`[MECH][${flag}][${msg.channelId}] ${msg.author.username}: ${msg.content}`);
-    await runPi(msg);
+    const wasOpen = Date.now() < (winExp.get(msg.channelId) ?? 0);
+    console.log(`[MECH][${flag}][${wasOpen ? "CONT" : "NEW"}][${msg.channelId}] ${msg.author.username}: ${msg.content}`);
+    let pre = "";
+    if (!wasOpen) {
+      lastFed.delete(msg.channelId);
+      pre = await fetchPreContext(msg);
+      await pi.newSession();
+    }
+    winExp.set(msg.channelId, Date.now() + WINDOW_MS);
+    // Mid-run mechanical: steer into the live run instead of a new one.
+    if (wasOpen && pi.isBusy()) {
+      console.log(`[MECH-STEER][${flag}][${msg.channelId}] ${msg.author.username}: ${msg.content}`);
+      if (await pi.trySteer(await buildSeed(msg))) return;
+    }
+    await runPi(msg, pre);
     return;
   }
 
@@ -141,7 +193,7 @@ client.on(Events.MessageCreate, async (msg) => {
     console.log(`[CLOSED][${msg.channelId}] ${msg.author.username}: ${msg.content}`);
     return;
   }
-  const history = (recent.get(msg.channelId) ?? []).slice(-6, -1).map(({ author, text }) => ({ author, text }));
+  const history = (recent.get(msg.channelId) ?? []).slice(-11, -1).map(({ author, text }) => ({ author, text }));
   const v = await judge({
     message: msg.content,
     author: msg.author.username,
@@ -149,6 +201,13 @@ client.on(Events.MessageCreate, async (msg) => {
   });
   if (v.action === "pass") {
     console.log(`[WIN][PASS n=${v.noul.toFixed(2)}][${msg.channelId}] ${msg.author.username}: ${msg.content}`);
+    // Jev yes reopens the window even if pi ends up silent.
+    winExp.set(msg.channelId, Date.now() + WINDOW_MS);
+    // Mid-run pass: steer into the live run instead of a new one.
+    if (pi.isBusy()) {
+      console.log(`[WIN-STEER][${msg.channelId}] ${msg.author.username}: ${msg.content}`);
+      if (await pi.trySteer(await buildSeed(msg))) return;
+    }
     await runPi(msg);
   } else {
     console.log(`[WIN][IGNORE n=${v.noul.toFixed(2)}][${msg.channelId}] ${msg.author.username}: ${msg.content}`);

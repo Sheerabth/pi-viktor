@@ -15,7 +15,13 @@ export class Pi {
 
   constructor(cwd: string) {
     const bin = process.env.PI_BIN ?? `${process.env.HOME}/.pi/agent/bin/pi`;
+    const home = process.env.HOME ?? "";
     this.proc = spawn(bin, ["--mode", "rpc", "--append-system-prompt", SYSTEM_PROMPT, "--extension", `${cwd}/src/pi-extensions/discord.ts`], {
+      env: {
+        ...process.env,
+        PATH: `${home}/.local/bin:${process.env.PATH ?? ""}`,
+        DISCORD_BOT_TOKEN: process.env.DISCORD_TOKEN ?? "",
+      },
       cwd,
       stdio: ["pipe", "pipe", "ignore"],
     });
@@ -43,9 +49,11 @@ export class Pi {
     }
   }
 
-  // Only the final assistant message leaves pi. Mid-run messages
-  // (acks, narrations) accumulate in lastMsg but never forward live.
-  private current: { text: string; lastMsg: string; res: (t: string) => void } | null = null;
+  // Pi owns delivery (curl to the Discord API). Bot watches bash tool
+  // calls to learn what posted. lastMsg is only a debug fallback.
+  private current: { text: string; lastMsg: string; discordSent: boolean; res: (t: string) => void } | null = null;
+  private sendIds = new Set<string>();
+  sentCount = 0;
 
   private onRecord(rec: any) {
     if (rec.type === "response" && rec.id && this.pending.has(rec.id)) {
@@ -63,7 +71,22 @@ export class Pi {
       }
       return;
     }
-    // Track the latest assistant message; only it posts at settle.
+    // A discord_send tool call = an outbound message.
+    if (rec.type === "tool_execution_start" && this.current) {
+      if (rec.toolName === "discord_send") this.sendIds.add(rec.toolCallId);
+      return;
+    }
+    if (rec.type === "tool_execution_end" && this.current) {
+      if (this.sendIds.has(rec.toolCallId)) {
+        this.sendIds.delete(rec.toolCallId);
+        if (!rec.isError) {
+          this.sentCount++;
+          if (this.current) this.current.discordSent = true;
+        }
+      }
+      return;
+    }
+    // Track the latest assistant message; debug fallback only.
     if (rec.type === "message_end" && this.current) {
       const m = rec.message;
       if (m?.role === "assistant" && Array.isArray(m.content)) {
@@ -79,7 +102,7 @@ export class Pi {
     if (rec.type === "agent_settled" && this.current) {
       const c = this.current;
       this.current = null;
-      c.res(c.lastMsg || c.text.trim());
+      c.res({ text: c.lastMsg || c.text.trim(), posted: c.discordSent });
     }
   }
 
@@ -113,15 +136,55 @@ export class Pi {
     });
   }
 
+  isBusy(): boolean {
+    return this.current !== null;
+  }
+
+  private steerCount = 0;
+  private static readonly MAX_STEERS = 2;
+
+  /** Steer a live run. False = no live run or steer budget spent (caller falls back to a queued run). */
+  async trySteer(message: string): Promise<boolean> {
+    if (!this.current || this.steerCount >= Pi.MAX_STEERS) return false;
+    try {
+      await this.send({ type: "steer", message });
+      if (this.current === null) return false;
+      this.steerCount++;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Fresh session for a new burst. Serialized with prompts. */
+  newSession(): Promise<void> {
+    const run = this.queue.then(async () => {
+      const before: string | null = await this.send({ type: "get_state" }).then((d: any) => d?.sessionFile ?? null).catch(() => null);
+      await this.send({ type: "new_session" });
+      const t0 = Date.now();
+      while (Date.now() - t0 < 4000) {
+        const cur: string | null = await this.send({ type: "get_state" }).then((d: any) => d?.sessionFile ?? null).catch(() => null);
+        if (cur && cur !== before) return;
+        await new Promise((r) => setTimeout(r, 200));
+      }
+    });
+    this.queue = run.catch(() => {});
+    return run;
+  }
+
   /** Serialize prompts — one run at a time for now. */
-  ask(message: string): Promise<string> {
+  ask(message: string): Promise<{ text: string; posted: boolean }> {
     const run = this.queue.then(async () => {
       const data: any = await this.send({ type: "prompt", message });
       if (data?.disposition === "handled") {
-        return await this.send({ type: "get_last_assistant_text" }).then((d: any) => d?.text ?? "");
+        const t: string = await this.send({ type: "get_last_assistant_text" }).then((d: any) => d?.text ?? "");
+        return { text: t, posted: false };
       }
-      return await new Promise<string>((res) => {
-        this.current = { text: "", lastMsg: "", res };
+      this.sendIds.clear();
+      this.sentCount = 0;
+      this.steerCount = 0;
+      return await new Promise<{ text: string; posted: boolean }>((res) => {
+        this.current = { text: "", lastMsg: "", discordSent: false, res };
       });
     });
     this.queue = run.catch(() => {});
